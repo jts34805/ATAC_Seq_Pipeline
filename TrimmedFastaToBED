@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# =============================================================================
+# SLURM directives
+# =============================================================================
+#SBATCH --job-name=atacseq
+#SBATCH --output=logs/slurm_%x_%j.out
+#SBATCH --error=logs/slurm_%x_%j.err
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --time=24:00:00
+#SBATCH --partition=batch        
+
+# =============================================================================
+# ATAC-seq Pipeline: FASTQ → BigWig (Paired-End only)
+# Reference: Zea mays B73 RefGen_v5 (AGPv5)
+# Tools: FastQC, Trimmomatic, Bowtie2, SAMtools, MACS2, deepTools
+#
+# Usage:
+#   Single sample:
+#     sbatch FastqToBigWig.sh
+#
+#   Array job — one job per sample, reading from samples.tsv:
+#     sbatch --array=1-N atacseq_pipeline_PE.sh
+#
+#   samples.tsv format (tab-separated, no header):
+#     SAMPLE  FASTQ_R1  FASTQ_R2
+# =============================================================================
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# USER CONFIG
+# ---------------------------------------------------------------------------
+GENOME_INDEX="/home/jts34805/Genomes/B73V5"        # Bowtie2 index prefix for B73 AGPv5
+CHROM_SIZES="/home/jts34805/Genomes/B73v5.chrom.sizes"         # Chromosome sizes file for B73 AGPv5
+ADAPTERS="/home/jts34805/TruSeq3-PE-2.fa"            
+OUTDIR="results"       # Root output directory
+
+THREADS="${SLURM_CPUS_PER_TASK:-16}"
+
+# Zea mays effective genome size ≈ 2.2 Gb
+MACS2_GSIZE=2182075994
+
+# OPTION A: single sample
+SAMPLE="EndoATAC_1"
+FASTQ_R1="/scratch/jts34805/EndoMethH2Az/fqs/EndoATAC_1_R1.fastq.gz"
+FASTQ_R2="/scratch/jts34805/EndoMethH2Az/fqs/EndoATAC_1_R2.fastq.gz"
+
+# OPTION B: array job — reads from samples.tsv (comment out OPTION A above)
+# SAMPLES_TSV="samples.tsv"
+# if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+#     LINE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$SAMPLES_TSV")
+#     SAMPLE=$(echo   "$LINE" | awk '{print $1}')
+#     FASTQ_R1=$(echo "$LINE" | awk '{print $2}')
+#     FASTQ_R2=$(echo "$LINE" | awk '{print $3}')
+# fi
+
+# ---------------------------------------------------------------------------
+# Load modules (edit to match your cluster's module system)
+# ---------------------------------------------------------------------------
+
+module load FastQC
+module load Trimmomatic
+module load Bowtie2
+module load SAMtools
+module load MACS2
+module load deepTools
+module load ucsc
+
+# ---------------------------------------------------------------------------
+# Derived paths
+# ---------------------------------------------------------------------------
+QC_RAW_DIR="${OUTDIR}/01_fastqc_raw"
+QC_TRIM_DIR="${OUTDIR}/02_fastqc_trimmed"
+TRIM_DIR="${OUTDIR}/03_trimmed"
+ALIGN_DIR="${OUTDIR}/04_aligned"
+PEAK_DIR="${OUTDIR}/05_peaks"
+BW_DIR="${OUTDIR}/06_bigwigs"
+LOG_DIR="${OUTDIR}/logs"
+
+mkdir -p "$QC_RAW_DIR" "$QC_TRIM_DIR" "$TRIM_DIR" "$ALIGN_DIR" \
+         "$PEAK_DIR" "$BW_DIR" "$LOG_DIR"
+
+# ---------------------------------------------------------------------------
+# Helper: log with timestamp
+# ---------------------------------------------------------------------------
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${SAMPLE}] $*"; }
+
+# ---------------------------------------------------------------------------
+# Validate inputs
+# ---------------------------------------------------------------------------
+for var in SAMPLE FASTQ_R1 FASTQ_R2 GENOME_INDEX CHROM_SIZES ADAPTERS; do
+    if [[ -z "${!var}" ]]; then
+        echo "ERROR: \$${var} is not set. Please fill in the USER CONFIG section."
+        exit 1
+    fi
+done
+
+log "Starting ATAC-seq pipeline"
+log "SLURM job ID  : ${SLURM_JOB_ID:-not_set}"
+log "SLURM array ID: ${SLURM_ARRAY_TASK_ID:-not_set}"
+log "Running on    : $(hostname)"
+log "CPUs          : ${THREADS}"
+
+# ---------------------------------------------------------------------------
+# 1. Raw QC — FastQC
+# ---------------------------------------------------------------------------
+log "STEP 1: Raw read QC with FastQC"
+
+fastqc -t "$THREADS" -o "$QC_RAW_DIR" "$FASTQ_R1" "$FASTQ_R2" \
+    2>"${LOG_DIR}/${SAMPLE}_fastqc_raw.log"
+
+log "FastQC complete. Reports in ${QC_RAW_DIR}/"
+
+# ---------------------------------------------------------------------------
+# 2. Adapter trimming — Trimmomatic (PE)
+# ---------------------------------------------------------------------------
+log "STEP 2: Adapter trimming with Trimmomatic (PE)"
+
+TRIM_R1="${TRIM_DIR}/${SAMPLE}_R1_trimmed.fastq.gz"
+TRIM_R2="${TRIM_DIR}/${SAMPLE}_R2_trimmed.fastq.gz"
+
+trimmomatic PE \
+    -threads "$THREADS" \
+    -phred33 \
+    "$FASTQ_R1" "$FASTQ_R2" \
+    "$TRIM_R1" /dev/null \
+    "$TRIM_R2" /dev/null \
+    ILLUMINACLIP:"${ADAPTERS}":2:30:10:8:keepBothReads \
+    LEADING:3 \
+    TRAILING:3 \
+    SLIDINGWINDOW:4:15 \
+    MINLEN:20 \
+    2>"${LOG_DIR}/${SAMPLE}_trimmomatic.log"
+
+log "Trimmomatic complete. Trimmed reads in ${TRIM_DIR}/"
+
+# ---------------------------------------------------------------------------
+# 3. Post-trim QC — FastQC
+# ---------------------------------------------------------------------------
+log "STEP 3: Post-trim QC with FastQC"
+
+fastqc -t "$THREADS" -o "$QC_TRIM_DIR" "$TRIM_R1" "$TRIM_R2" \
+    2>"${LOG_DIR}/${SAMPLE}_fastqc_trimmed.log"
+
+log "Post-trim FastQC complete."
+
+# ---------------------------------------------------------------------------
+# 4. Alignment — Bowtie2 (PE) → B73 AGPv5
+#    --maxins 2000  : captures full range of ATAC fragment sizes
+#                     (sub-nucleosomal ~100bp through multi-nucleosomal ~2kb)
+# ---------------------------------------------------------------------------
+log "STEP 4: Aligning to B73 AGPv5 with Bowtie2 (PE)"
+
+RAW_BAM="${ALIGN_DIR}/${SAMPLE}_raw.bam"
+
+bowtie2 \
+    -p "$THREADS" \
+    -x "$GENOME_INDEX" \
+    -1 "$TRIM_R1" \
+    -2 "$TRIM_R2" \
+    --no-mixed \
+    --no-discordant \
+    --maxins 2000 \
+    2>"${LOG_DIR}/${SAMPLE}_bowtie2.log" \
+| samtools view -bS -@ "$THREADS" - > "$RAW_BAM"
+
+log "Bowtie2 alignment complete."
+
+# ---------------------------------------------------------------------------
+# 5. SAMtools: sort, filter, deduplicate, index
+#    -f 2    : require properly paired reads
+#    -F 2308 : remove unmapped, secondary, supplementary
+#    -q 10   : MAPQ ≥ 10
+# ---------------------------------------------------------------------------
+log "STEP 5: SAMtools sort, filter, markdup, index"
+
+SORTED_BAM="${ALIGN_DIR}/${SAMPLE}_sorted.bam"
+FILTERED_BAM="${ALIGN_DIR}/${SAMPLE}_filtered.bam"
+DEDUP_BAM="${ALIGN_DIR}/${SAMPLE}_dedup.bam"
+DEDUP_METRICS="${LOG_DIR}/${SAMPLE}_markdup_metrics.txt"
+
+# Sort by coordinate
+samtools sort -@ "$THREADS" -o "$SORTED_BAM" "$RAW_BAM" \
+    2>"${LOG_DIR}/${SAMPLE}_sort.log"
+
+samtools index -@ "$THREADS" "$SORTED_BAM"
+
+# Filter: require proper pair, remove unmapped/secondary/supplementary, MAPQ ≥ 10
+samtools view -@ "$THREADS" -b -f 2 -F 2308 -q 10 \
+    -o "$FILTERED_BAM" "$SORTED_BAM" \
+    2>"${LOG_DIR}/${SAMPLE}_filter.log"
+
+# Mark and remove duplicates
+samtools markdup -@ "$THREADS" -r -f "$DEDUP_METRICS" \
+    "$FILTERED_BAM" "$DEDUP_BAM" \
+    2>"${LOG_DIR}/${SAMPLE}_markdup.log"
+
+# Index final BAM
+samtools index -@ "$THREADS" "$DEDUP_BAM" \
+    2>"${LOG_DIR}/${SAMPLE}_index.log"
+
+# Alignment summary
+samtools flagstat "$DEDUP_BAM" > "${LOG_DIR}/${SAMPLE}_flagstat.txt"
+
+# Clean up intermediates
+rm -f "$RAW_BAM" "$SORTED_BAM" "${SORTED_BAM}.bai" "$FILTERED_BAM"
+
+log "SAMtools processing complete. Final BAM: ${DEDUP_BAM}"
+
+# ---------------------------------------------------------------------------
+# 6. Peak calling — MACS2 (ATAC-seq settings)
+#    --nomodel        : skip the fragment model estimation
+#    --shift -37      : shift reads upstream (Tn5 cut site adjustment)
+#    --extsize 75     : extend reads 75bp
+#    --nolambda       : disable local lambda background (no input control)
+#    --keep-dup all   : duplicates already removed by SAMtools markdup
+# ---------------------------------------------------------------------------
+log "STEP 6: Peak calling with MACS2 (ATAC-seq)"
+
+macs2 callpeak \
+    -t "$DEDUP_BAM" \
+    -f BAMPE \
+    -g "$MACS2_GSIZE" \
+    -n "$SAMPLE" \
+    --outdir "$PEAK_DIR" \
+    --nomodel \
+    --shift -37 \
+    --extsize 75 \
+    --nolambda \
+    --keep-dup all \
+    -B \
+    --SPMR \
+    -q 0.05 \
+    2>"${LOG_DIR}/${SAMPLE}_macs2.log"
+
+log "MACS2 complete. Peaks in ${PEAK_DIR}/"
+
+# ---------------------------------------------------------------------------
+# 7. BigWig generation — deepTools bamCoverage
+#    --centerReads    : center each fragment on the Tn5 cut site,
+#                       better for visualising accessibility signal
+# ---------------------------------------------------------------------------
+log "STEP 7: Generating bigWig with deepTools bamCoverage (RPKM)"
+
+BIGWIG="${BW_DIR}/${SAMPLE}_RPKM.bw"
+
+bamCoverage \
+    -b "$DEDUP_BAM" \
+    -o "$BIGWIG" \
+    --binSize 10 \
+    --normalizeUsing RPKM \
+    --effectiveGenomeSize 2182075994 \
+    --centerReads \
+    --ignoreDuplicates \
+    -p "$THREADS" \
+    2>"${LOG_DIR}/${SAMPLE}_bamCoverage.log"
+
+log "bigWig written to ${BIGWIG}"
+
+# Convert MACS2 bedGraph to bigWig if present
+BEDGRAPH="${PEAK_DIR}/${SAMPLE}_treat_pileup.bdg"
+BDG_SORTED="${PEAK_DIR}/${SAMPLE}_treat_pileup_sorted.bdg"
+MACS2_BW="${BW_DIR}/${SAMPLE}_MACS2_pileup.bw"
+
+if [[ -f "$BEDGRAPH" ]]; then
+    log "Converting MACS2 bedGraph to bigWig"
+    sort -k1,1 -k2,2n "$BEDGRAPH" > "$BDG_SORTED"
+    bedGraphToBigWig "$BDG_SORTED" "$CHROM_SIZES" "$MACS2_BW" \
+        2>"${LOG_DIR}/${SAMPLE}_bdg2bw.log"
+    rm -f "$BDG_SORTED"
+    log "MACS2 bigWig written to ${MACS2_BW}"
+fi
+
+# ---------------------------------------------------------------------------
+# Done
+# ---------------------------------------------------------------------------
+log "=== Pipeline complete ==="
+log "Output structure:"
+log "  Raw QC         : ${QC_RAW_DIR}/"
+log "  Trimmed QC     : ${QC_TRIM_DIR}/"
+log "  Trimmed reads  : ${TRIM_DIR}/"
+log "  BAM            : ${DEDUP_BAM}"
+log "  Peaks          : ${PEAK_DIR}/"
+log "  bigWigs        : ${BW_DIR}/"
+log "  Logs           : ${LOG_DIR}/"
