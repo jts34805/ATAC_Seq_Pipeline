@@ -43,8 +43,8 @@ MACS2_GSIZE=2182075994
 
 # OPTION A: single sample
 SAMPLE="EndoATAC_1"
-FASTQ_R1="/scratch/jts34805/EndoMethH2Az/fqs/EndoATAC_1_R1.fastq.gz"
-FASTQ_R2="/scratch/jts34805/EndoMethH2Az/fqs/EndoATAC_1_R2.fastq.gz"
+FASTQ_R1="/scratch/jts34805/ATACMethH2Az/fqs/EndoATAC_1_R1.fastq.gz"
+FASTQ_R2="/scratch/jts34805/ATACMethH2Az/fqs/EndoATAC_1_R2.fastq.gz"
 
 # OPTION B: array job — reads from samples.tsv (comment out OPTION A above)
 # SAMPLES_TSV="samples.tsv"
