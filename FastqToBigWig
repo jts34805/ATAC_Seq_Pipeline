@@ -176,14 +176,22 @@ log "Bowtie2 alignment complete."
 log "STEP 5: SAMtools sort, filter, markdup, index"
 
 SORTED_BAM="${ALIGN_DIR}/${SAMPLE}_sorted.bam"
+NAMESORTED_BAM="${ALIGN_DIR}/${SAMPLE}_namesorted.bam"
 FIXED_BAM="${ALIGN_DIR}/${SAMPLE}_fixed.bam"
-MARKED_BAM="${ALIGN_DIR}/${SAMPLE}_marked.bam"
 FILTERED_BAM="${ALIGN_DIR}/${SAMPLE}_filtered.bam"
 DEDUP_BAM="${ALIGN_DIR}/${SAMPLE}_dedup.bam"
 DEDUP_METRICS="${LOG_DIR}/${SAMPLE}_markdup_metrics.txt"
 
+# Sort by queryname (required for fixmate)
+samtools sort -n -@ "$THREADS" -o "$NAMESORTED_BAM" "$RAW_BAM" \
+    2>"${LOG_DIR}/${SAMPLE}_namesort.log"
+
+# Add mate score tags (required for markdup)
+samtools fixmate -@ "$THREADS" -m "$NAMESORTED_BAM" "$FIXED_BAM" \
+    2>"${LOG_DIR}/${SAMPLE}_fixmate.log"
+
 # Sort by coordinate
-samtools sort -@ "$THREADS" -o "$SORTED_BAM" "$RAW_BAM" \
+samtools sort -@ "$THREADS" -o "$SORTED_BAM" "$FIXED_BAM" \
     2>"${LOG_DIR}/${SAMPLE}_sort.log"
 
 samtools index -@ "$THREADS" "$SORTED_BAM"
@@ -193,13 +201,9 @@ samtools view -@ "$THREADS" -b -f 2 -F 2308 -q 10 \
     -o "$FILTERED_BAM" "$SORTED_BAM" \
     2>"${LOG_DIR}/${SAMPLE}_filter.log"
 
-samtools fixmate -@ "$THREADS" -m "$FILTERED_BAM" "$FIXED_BAM" 
-
-samtools sort -o "$MARKED_BAM" "$FIXED_BAM"
-
 # Mark and remove duplicates
 samtools markdup -@ "$THREADS" -r -f "$DEDUP_METRICS" \
-    "$MARKED_BAM" "$DEDUP_BAM" \
+    "$FILTERED_BAM" "$DEDUP_BAM" \
     2>"${LOG_DIR}/${SAMPLE}_markdup.log"
 
 # Index final BAM
@@ -210,7 +214,7 @@ samtools index -@ "$THREADS" "$DEDUP_BAM" \
 samtools flagstat "$DEDUP_BAM" > "${LOG_DIR}/${SAMPLE}_flagstat.txt"
 
 # Clean up intermediates
-rm -f "$RAW_BAM" "$SORTED_BAM" "${SORTED_BAM}.bai" "$FILTERED_BAM"
+rm -f "$RAW_BAM" "$NAMESORTED_BAM" "$FIXED_BAM" "$SORTED_BAM" "${SORTED_BAM}.bai" "$FILTERED_BAM"
 
 log "SAMtools processing complete. Final BAM: ${DEDUP_BAM}"
 
